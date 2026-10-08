@@ -24,6 +24,8 @@ from .topology import (
 MAX_QUANTITY = 2**63 - 1
 MAX_TRANSACTIONS = 100
 MAX_BLOCK_BYTES = 128 * 1024
+MAX_CHAIN_PAGE_CERTIFICATES = 16
+MAX_CHAIN_PAGE_BYTES = 256 * 1024
 TRANSACTION_DOMAIN = b"spectra/transaction/v1\x00"
 PROPOSAL_DOMAIN = b"spectra/proposal/v1\x00"
 VOTE_DOMAIN = b"spectra/vote/v1\x00"
@@ -196,9 +198,9 @@ def validate_genesis(genesis: Any) -> str:
         raise ValueError("genesis edges must be sorted and canonical")
     expected_spectral = spectral_certificate(8, graph)
     expected_resilience = resilience_certificate(8, graph, 2)
-    if topology["spectral"] != expected_spectral:
+    if canonical_bytes(topology["spectral"]) != canonical_bytes(expected_spectral):
         raise ValueError("genesis spectral metadata does not match its graph")
-    if topology["resilience"] != expected_resilience:
+    if canonical_bytes(topology["resilience"]) != canonical_bytes(expected_resilience):
         raise ValueError("genesis resilience metadata does not match its graph")
     return hashlib.sha256(canonical_bytes(genesis)).hexdigest()
 
@@ -596,6 +598,36 @@ class Ledger:
                 (first_height,),
             ).fetchall()
             return [strict_json_loads(row[0].encode("utf-8")) for row in rows]
+
+    def certificates_page(self, first_height: int) -> Dict[str, Any]:
+        _quantity(first_height, "first height", 1)
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT height, certificate FROM certificates WHERE height>=? ORDER BY height",
+                (first_height,),
+            ).fetchall()
+            page: List[Dict[str, Any]] = []
+            next_height = first_height
+            for index, (height, raw_certificate) in enumerate(rows):
+                certificate = strict_json_loads(raw_certificate.encode("utf-8"))
+                candidate = {
+                    "certificates": page + [certificate],
+                    "next_height": height + 1,
+                    "more": index + 1 < len(rows),
+                }
+                if len(canonical_bytes(candidate)) > MAX_CHAIN_PAGE_BYTES:
+                    if not page:
+                        raise ValueError("chain certificate exceeds page size")
+                    break
+                page.append(certificate)
+                next_height = height + 1
+                if len(page) >= MAX_CHAIN_PAGE_CERTIFICATES:
+                    break
+            return {
+                "certificates": page,
+                "next_height": next_height,
+                "more": len(page) < len(rows),
+            }
 
     def status(self) -> Dict[str, Any]:
         with self._lock:

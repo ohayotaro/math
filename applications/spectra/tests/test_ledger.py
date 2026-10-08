@@ -1,4 +1,6 @@
 import json
+import shutil
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -51,6 +53,21 @@ def test_signatures_are_bound_to_full_genesis_and_transaction_fields(devnet):
     assert validate_genesis(other_genesis) != digest
     with pytest.raises(ValueError, match="signature"):
         validate_transaction(transaction, validate_genesis(other_genesis))
+
+    changed_supply = json.loads(json.dumps(genesis))
+    changed_supply["balances"] = {changed_supply["faucet"]: 999_999}
+    assert changed_supply["chain_id"] == genesis["chain_id"]
+    with pytest.raises(ValueError, match="signature"):
+        validate_transaction(transaction, validate_genesis(changed_supply))
+
+    changed_spectral = json.loads(json.dumps(genesis))
+    changed_spectral["topology"]["spectral"]["strict_ramanujan"] = 1
+    with pytest.raises(ValueError, match="spectral"):
+        validate_genesis(changed_spectral)
+    changed_resilience = json.loads(json.dumps(genesis))
+    changed_resilience["topology"]["resilience"]["connected"] = 1
+    with pytest.raises(ValueError, match="resilience"):
+        validate_genesis(changed_resilience)
 
     changed = dict(transaction, amount=transaction["amount"] + 1)
     with pytest.raises(ValueError, match="signature"):
@@ -156,3 +173,52 @@ def test_quorum_certificate_validation_vote_lock_and_restart(devnet, tmp_path):
     finally:
         for ledger in ledgers.values():
             ledger.close()
+
+
+def test_restart_rejects_tampered_snapshot_and_certificate(devnet, tmp_path):
+    root, genesis = devnet
+    paths = {
+        node_id: tmp_path / ("node-%d.sqlite3" % node_id)
+        for node_id in range(8)
+    }
+    ledgers = {
+        node_id: Ledger(
+            str(paths[node_id]), genesis, node_id, _private_key(root, node_id)
+        )
+        for node_id in range(8)
+    }
+    try:
+        proposal = ledgers[0].propose([_tx(root, genesis, amount=5)])
+        votes = [ledgers[node_id].vote(proposal) for node_id in range(6)]
+        certificate = make_certificate(proposal, votes)
+        for ledger in ledgers.values():
+            ledger.commit_certificate(certificate)
+    finally:
+        for ledger in ledgers.values():
+            ledger.close()
+
+    snapshot_path = tmp_path / "tampered-snapshot.sqlite3"
+    certificate_path = tmp_path / "tampered-certificate.sqlite3"
+    shutil.copyfile(paths[7], snapshot_path)
+    shutil.copyfile(paths[7], certificate_path)
+    connection = sqlite3.connect(str(snapshot_path))
+    connection.execute("UPDATE snapshot SET balances=?", ("{}",))
+    connection.commit()
+    connection.close()
+    with pytest.raises(ValueError, match="snapshot"):
+        Ledger(str(snapshot_path), genesis, 7, _private_key(root, 7))
+
+    connection = sqlite3.connect(str(certificate_path))
+    raw_certificate = connection.execute(
+        "SELECT certificate FROM certificates WHERE height=1"
+    ).fetchone()[0]
+    tampered = json.loads(raw_certificate)
+    tampered["block"]["state_root"] = "0" * 64
+    connection.execute(
+        "UPDATE certificates SET certificate=? WHERE height=1",
+        (json.dumps(tampered, sort_keys=True, separators=(",", ":")),),
+    )
+    connection.commit()
+    connection.close()
+    with pytest.raises(ValueError, match="signature"):
+        Ledger(str(certificate_path), genesis, 7, _private_key(root, 7))

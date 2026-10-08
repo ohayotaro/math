@@ -2,16 +2,27 @@ import json
 import socket
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import pytest
 
 from spectra.cli import APPLICATION_ROOT, init_directory, transfer
-from spectra.ledger import Ledger, validate_genesis
+from spectra.ledger import (
+    Ledger,
+    create_transaction,
+    make_certificate,
+    new_keypair,
+    validate_genesis,
+)
 from spectra.node import (
+    BoundedThreadingHTTPServer,
     NodeService,
     QuorumUnavailable,
+    RequestHandler,
     _shortest_path,
     wait_for_node,
 )
@@ -62,6 +73,58 @@ def _post_sync(validator, neighbor):
         return json.loads(response.read().decode("utf-8"))
 
 
+def test_incomplete_body_times_out_and_handler_slot_recovers(tmp_path, monkeypatch):
+    root = tmp_path / "timeout"
+    init_directory(str(root), _free_base_port())
+    service = NodeService(str(root), 0)
+    inbound_timeout = 0.2
+    monkeypatch.setattr("spectra.node.MAX_HANDLERS", 1)
+    monkeypatch.setattr("spectra.node.INBOUND_TIMEOUT", inbound_timeout)
+    server = BoundedThreadingHTTPServer(("127.0.0.1", 0), RequestHandler, service)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    address = server.server_address
+    partial = socket.create_connection(address, timeout=1)
+    partial.sendall(
+        b"POST /submit HTTP/1.1\r\n"
+        b"Host: 127.0.0.1\r\n"
+        b"Content-Length: 2\r\n"
+        b"Connection: close\r\n\r\n"
+        b"x"
+    )
+    try:
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            try:
+                with urlopen(
+                    "http://127.0.0.1:%d/status" % address[1], timeout=0.2
+                ):
+                    pytest.fail("handler slot was not occupied by incomplete request")
+            except HTTPError as exc:
+                if exc.code == 503:
+                    break
+            except OSError:
+                pass
+            time.sleep(0.01)
+        else:
+            pytest.fail("handler slot did not reject a concurrent request")
+
+        partial.settimeout(1)
+        started = time.monotonic()
+        while partial.recv(4096):
+            pass
+        assert time.monotonic() - started < inbound_timeout + 0.5
+
+        with urlopen("http://127.0.0.1:%d/status" % address[1], timeout=1) as response:
+            assert response.status == 200
+    finally:
+        partial.close()
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+        service.ledger.close()
+
+
 def test_no_quorum_does_not_finalize_a_block(tmp_path, monkeypatch):
     root = tmp_path / "no-quorum"
     genesis = init_directory(str(root), _free_base_port())
@@ -104,6 +167,131 @@ def test_no_quorum_does_not_finalize_a_block(tmp_path, monkeypatch):
         service.ledger.close()
         for ledger in voter_ledgers.values():
             ledger.close()
+
+
+def test_concurrent_submits_are_serialized(tmp_path, monkeypatch):
+    root = tmp_path / "concurrent"
+    genesis = init_directory(str(root), _free_base_port())
+    service = NodeService(str(root), 0)
+    voter_ledgers = {
+        node_id: Ledger(
+            str(root / "data" / ("mock-node-%d.sqlite3" % node_id)),
+            genesis,
+            node_id,
+            _private_key(root, node_id),
+        )
+        for node_id in range(1, 8)
+    }
+
+    def overlay(path, message, received=False):
+        node_id = path[-1]
+        if message["kind"] == "vote":
+            return {"vote": voter_ledgers[node_id].vote(message["block"])}
+        voter_ledgers[node_id].commit_certificate(message["certificate"])
+        return {"committed": voter_ledgers[node_id].height}
+
+    monkeypatch.setattr(service, "_post_overlay", overlay)
+    faucet = (root / "keys" / "faucet.key").read_text().strip()
+    digest = validate_genesis(genesis)
+    sender_one_private, sender_one = new_keypair()
+    sender_two_private, sender_two = new_keypair()
+    try:
+        service.submit({
+            "transactions": [
+                create_transaction(faucet, digest, sender_one, 10, 1)
+            ]
+        })
+        service.submit({
+            "transactions": [
+                create_transaction(faucet, digest, sender_two, 10, 2)
+            ]
+        })
+        transactions = [
+            create_transaction(
+                sender_one_private, digest, genesis["validators"][3]["public_key"], 3, 1
+            ),
+            create_transaction(
+                sender_two_private, digest, genesis["validators"][4]["public_key"], 4, 1
+            ),
+        ]
+        results = []
+        errors = []
+
+        def submit(transaction):
+            try:
+                results.append(service.submit({"transactions": [transaction]}))
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=submit, args=(transaction,)) for transaction in transactions]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        assert not errors
+        assert sorted(result["height"] for result in results) == [3, 4]
+        assert service.ledger.height == 4
+        assert all(ledger.height == 4 for ledger in voter_ledgers.values())
+    finally:
+        service.ledger.close()
+        for ledger in voter_ledgers.values():
+            ledger.close()
+
+
+def test_neighbor_sync_paginates_history(tmp_path, monkeypatch):
+    root = tmp_path / "pagination"
+    genesis = init_directory(str(root), _free_base_port())
+    neighbor = next(
+        edge[1] if edge[0] == 0 else edge[0]
+        for edge in genesis["topology"]["edges"]
+        if 0 in edge
+    )
+    service = NodeService(str(root), neighbor)
+    ledgers = {
+        0: Ledger(
+            str(root / "data" / "source.sqlite3"),
+            genesis,
+            0,
+            _private_key(root, 0),
+        ),
+    }
+    for node_id in range(1, 8):
+        ledgers[node_id] = Ledger(
+            str(root / "data" / ("source-voter-%d.sqlite3" % node_id)),
+            genesis,
+            node_id,
+            _private_key(root, node_id),
+        )
+    faucet = (root / "keys" / "faucet.key").read_text().strip()
+    digest = validate_genesis(genesis)
+    try:
+        for nonce in range(1, 18):
+            transaction = create_transaction(
+                faucet, digest, genesis["validators"][1]["public_key"], 1, nonce
+            )
+            block = ledgers[0].propose([transaction])
+            votes = [ledgers[node_id].vote(block) for node_id in range(6)]
+            certificate = make_certificate(block, votes)
+            for ledger in ledgers.values():
+                ledger.commit_certificate(certificate)
+
+        requests = []
+
+        def request(method, host, port, path, payload=None):
+            requests.append(path)
+            if path == "/status":
+                return ledgers[0].status()
+            first_height = int(path.split("=")[1])
+            return ledgers[0].certificates_page(first_height)
+
+        monkeypatch.setattr("spectra.node._request_json", request)
+        result = service.sync_from_neighbor(0)
+        assert result == {"height": 17, "replayed": 17, "target_height": 17}
+        assert len([path for path in requests if path.startswith("/chain")]) == 2
+    finally:
+        for ledger in ledgers.values():
+            ledger.close()
+        service.ledger.close()
 
 
 def test_eight_process_overlay_transfer_and_neighbor_catchup(tmp_path):

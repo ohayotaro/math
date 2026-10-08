@@ -52,6 +52,8 @@ python -m spectra transfer --directory "$HOME/spectra-devnet" \
 
 ノードを停止中に確定ブロックができた場合は、再起動後に稼働中の**直接隣接ノード**
 から証明書を同期します。`topology.edges` 上の隣接先IDを指定してください。
+同期は応答サイズと証明書数でページ分割し、開始時点で観測した隣接ノードの高さまで
+取得して終了します。
 
 ```sh
 python -m spectra sync --directory "$HOME/spectra-devnet" --id 7 --neighbor 3

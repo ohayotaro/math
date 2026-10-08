@@ -15,11 +15,17 @@ from urllib.request import (
     urlopen,
 )
 
-from .ledger import Ledger, strict_json_loads
+from .ledger import (
+    MAX_CHAIN_PAGE_BYTES,
+    Ledger,
+    canonical_bytes,
+    strict_json_loads,
+)
 
 MAX_REQUEST_BYTES = 256 * 1024
 MAX_HANDLERS = 24
 RPC_TIMEOUT = 3.0
+INBOUND_TIMEOUT = RPC_TIMEOUT
 
 
 def _shortest_path(
@@ -52,6 +58,7 @@ class NodeService:
         self.edges = self.genesis["topology"]["edges"]
         self.relayed_messages = 0
         self._relay_lock = threading.Lock()
+        self._submit_lock = threading.Lock()
         private_key = (self.directory / "keys" / ("node-%d.key" % node_id)).read_text(
             encoding="ascii"
         ).strip()
@@ -102,6 +109,10 @@ class NodeService:
         raise ValueError("unknown overlay message")
 
     def submit(self, value: Any) -> Dict[str, Any]:
+        with self._submit_lock:
+            return self._submit(value)
+
+    def _submit(self, value: Any) -> Dict[str, Any]:
         if self.ledger.node_id != 0:
             raise ValueError("transactions must be submitted to leader zero")
         if type(value) is not dict or set(value) != {"transactions"}:
@@ -157,20 +168,59 @@ class NodeService:
         if neighbor == node_id or edge not in self.edges:
             raise ValueError("catch-up source must be a direct genesis neighbor")
         endpoint = self.validators[neighbor]
-        result = _request_json(
+        status = _request_json(
             "GET",
             endpoint["host"],
             endpoint["port"],
-            "/chain?from=%d" % (self.ledger.height + 1),
+            "/status",
         )
-        if type(result) is not dict or set(result) != {"certificates"}:
-            raise ValueError("invalid neighbor chain response")
-        certificates = result["certificates"]
-        if type(certificates) is not list:
-            raise ValueError("invalid neighbor certificate list")
-        for certificate in certificates:
-            self.ledger.commit_certificate(certificate)
-        return {"height": self.ledger.height, "replayed": len(certificates)}
+        if (
+            type(status) is not dict
+            or status.get("node_id") != neighbor
+            or status.get("genesis_hash") != self.ledger.genesis_hash
+            or type(status.get("height")) is not int
+        ):
+            raise ValueError("invalid neighbor status response")
+        target_height = status["height"]
+        replayed = 0
+        while self.ledger.height < target_height:
+            first_height = self.ledger.height + 1
+            result = _request_json(
+                "GET",
+                endpoint["host"],
+                endpoint["port"],
+                "/chain?from=%d" % first_height,
+            )
+            if type(result) is not dict or set(result) != {
+                "certificates", "next_height", "more"
+            }:
+                raise ValueError("invalid neighbor chain response")
+            certificates = result["certificates"]
+            next_height = result["next_height"]
+            more = result["more"]
+            if (
+                type(certificates) is not list
+                or type(next_height) is not int
+                or type(more) is not bool
+                or next_height != first_height + len(certificates)
+                or next_height <= first_height and certificates
+            ):
+                raise ValueError("invalid neighbor chain page")
+            if not certificates:
+                raise ValueError("neighbor chain page made no progress")
+            remaining = target_height - self.ledger.height
+            for certificate in certificates[:remaining]:
+                self.ledger.commit_certificate(certificate)
+                replayed += 1
+            if self.ledger.height >= target_height:
+                break
+            if not more:
+                raise ValueError("neighbor chain ended before target height")
+        return {
+            "height": self.ledger.height,
+            "replayed": replayed,
+            "target_height": target_height,
+        }
 
 
 class QuorumUnavailable(Exception):
@@ -190,6 +240,7 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
         super().__init__(address, handler)
 
     def process_request(self, request: Any, client_address: Any) -> None:
+        request.settimeout(INBOUND_TIMEOUT)
         if not self._handler_slots.acquire(blocking=False):
             try:
                 request.sendall(
@@ -263,15 +314,10 @@ class RequestHandler(BaseHTTPRequestHandler):
                 return
             try:
                 first_height = int(query["from"][0])
-                certificates = self.service.ledger.certificates_from(first_height)
-                encoded = json.dumps(
-                    {"certificates": certificates},
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-                if len(encoded) > MAX_REQUEST_BYTES:
+                page = self.service.ledger.certificates_page(first_height)
+                if len(canonical_bytes(page)) > MAX_CHAIN_PAGE_BYTES:
                     raise ValueError("chain response exceeds size limit")
-                self._send_json(200, {"certificates": certificates})
+                self._send_json(200, page)
             except Exception as exc:
                 self._send_json(400, {"error": str(exc)})
             return
