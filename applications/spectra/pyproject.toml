@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spectra-devnet"
+version = "0.1.0"
+description = "A research-inspired, local-only ledger and sparse validator network"
+requires-python = ">=3.9"
+dependencies = [
+    "cryptography>=44,<47",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.10,<2",
+    "pytest>=8,<9",
+    "ruff>=0.8,<1",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["spectra*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.mypy]
+python_version = "3.9"
+files = ["spectra"]
+ignore_missing_imports = true
+strict = true
